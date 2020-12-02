@@ -1,10 +1,12 @@
 
 
 This is a **Public Repo** which includes:
+
 A cloudformation script for checking the AWS cli-login api and send notification to slack.
+
 A terraform script for assuming role between two accounts, in order to fetch the slack webhook-url from parameter-store of another account.
 
-The Slack notification would look like this:
+The **Slack notification** would look like this:
 
 ---
 
