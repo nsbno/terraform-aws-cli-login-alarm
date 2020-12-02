@@ -10,7 +10,7 @@ The **Slack notification** would look like this:
 
 ---
 
-*AWSLogin via CLI*
+**AWSLogin via CLI**
 
 AccountId: $AccountId
 
