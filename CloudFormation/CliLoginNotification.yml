@@ -1,0 +1,185 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Cli Login Notification
+
+Parameters: 
+  CloudtrailLogGroupName: 
+    Description: "CloudTrail log group that fetches api calls"
+    Type: String
+    Default: "myloggroup"
+  CloudtrailLogGroupArn:
+    Description: "Arn of the Cloudtrail logroup"
+    Type: String
+    Default: "arn:aws:logs:eu-west-1:masteraccountid:log-group:myloggroup:*"
+Resources:
+  SubscriptionFilter: 
+    Type: 'AWS::Logs::SubscriptionFilter'
+    DependsOn: LambdaInvokePermission
+    Properties:
+      LogGroupName: !Ref CloudtrailLogGroupName
+      FilterPattern: "{ ($.eventName = \"AssumeRoleWithSAML\") && ($.userAgent != \"AWS Signin*\") && ($.requestParameters.roleArn = \"*SAML-AdministratorRole\") }"
+      DestinationArn: 
+        Fn::GetAtt: 
+          - "LambdaFunction"
+          - "Arn"
+  LambdaExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      PermissionsBoundary: arn:aws:iam::masteraccountid:policy/Boundary
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Action: ['sts:AssumeRole']
+            Effect: Allow
+            Principal:
+              Service: [lambda.amazonaws.com]
+      Path: "/"
+      Policies:
+        - PolicyName: 'AllowCloudWatchWrite'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Effect: "Allow"
+                Resource:
+                  Fn::Join:
+                    - ''
+                    - - 'arn:aws:logs:'
+                      - Ref: AWS::Region
+                      - ':'
+                      - Ref: AWS::AccountId
+                      - ':log-group:/aws/lambda/CliLogin-Notification-LambdaFunction-Login-Notification:*'
+              - Action:
+                  - cloudwatch:PutMetricData
+                Effect: "Allow"
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    cloudwatch:namespace: CUSTOME/SignInviaCLI
+        - PolicyName: 'AssumingRole'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Action: 
+                  - sts:AssumeRole
+                Effect: "Allow"
+                Resource: ["arn:aws:iam::*:role/Master_Assume_Role"]      
+      RoleName: LambdaExe-CliLogin-Notification
+  LambdaFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:     
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import logging
+          import os
+          import sys
+          import gzip
+          import base64
+          from base64 import b64decode
+          from urllib.request import Request, urlopen
+          from urllib.error import URLError, HTTPError
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          def lambda_handler(event, context):
+              logger.info("Event: " + str(event))
+              message_encoded = event['awslogs']['data']
+              compressed_payload = base64.b64decode(message_encoded)
+              uncompressed_payload = gzip.decompress(compressed_payload)
+              payload = json.loads(uncompressed_payload)
+              logEvents = payload["logEvents"]
+              process_assume_saml(json.loads(logEvents[0]["message"]))
+          def process_assume_saml(event):
+              global HooK_URL
+              global serviceaccount
+              HooK_URL = ""
+              serviceaccount = ""
+              print(event)
+              accountid = event['resources'][0]['accountId']
+              username = event['userIdentity']['userName']
+              rolearn = event['requestParameters']['roleArn']
+              sourceIP = event["sourceIPAddress"]
+              eventname = event["eventName"]
+              eventtime = event["eventTime"]
+              print("AccountID:", accountid)
+              data = json.loads(os.environ['Accounts'])
+              if accountid == data["a1"]:
+                serviceaccount = os.environ['a1_service_account']
+              elif accountid == data["a2"]:
+                serviceaccount = os.environ['a2_service_account']
+              else:
+                sys.exit("AccountID doesn't match!")
+              sts_connection = boto3.client('sts')
+              acct_b = sts_connection.assume_role(RoleArn="arn:aws:iam::%s:role/Master_Assume_Role" % serviceaccount, RoleSessionName="cross_acct_lambda") 
+              ACCESS_KEY = acct_b['Credentials']['AccessKeyId']
+              SECRET_KEY = acct_b['Credentials']['SecretAccessKey']
+              SESSION_TOKEN = acct_b['Credentials']['SessionToken']
+              ssm = boto3.client('ssm', aws_access_key_id=ACCESS_KEY, aws_secret_access_key=SECRET_KEY, aws_session_token=SESSION_TOKEN,)
+              parameter = ssm.get_parameter(Name='/slack_webhook/webhookurl')
+              print("WebHookUrl:", parameter['Parameter']['Value'])
+              HooK_URL = parameter['Parameter']['Value']
+              
+                
+              cloudwatch = boto3.client('cloudwatch')
+              cloudwatch.put_metric_data(
+                MetricData=[
+                {
+                  'MetricName': 'Incomming Login API',
+                  'Dimensions': [
+                      {
+                          'Name': 'Username',
+                          'Value': username
+                      },
+                      {
+                          'Name': 'AccountId',
+                          'Value': accountid
+                      }
+                  ],
+                  'Unit': 'Count',
+                  'Value': 1
+                },
+                ],
+                Namespace='CUSTOME/SignInviaCLI'
+              )
+              slack_message = {
+                  'text': "*AWSLogin via CLI* :face_with_monocle: \n - AccountId: %s \n - UserName: %s \n - RoleArn: %s \n - SourceIPAddress: %s \n - EventName: %s \n - EventTime: %s \n" % (accountid, username, rolearn, sourceIP, eventname, eventtime)
+              }
+              req = Request(HooK_URL, json.dumps(slack_message).encode('utf-8'))
+              try:
+                response = urlopen(req)
+                response.read()
+                logger.info("Message posted to the Slack")
+              except HTTPError as e:
+                logger.error("Request failed: %d %s", e.code, e.reason)
+              except URLError as e:
+                logger.error("Server connection failed: %s", e.reason)
+
+      Description: Monitor Lambda Function
+      Handler: 'index.lambda_handler'
+      Role: !GetAtt 
+        - LambdaExecutionRole
+        - Arn
+      Runtime: python3.7  
+      Environment:
+        Variables:
+          Accounts: '{"a1":"accountid1", "a2":"accountid2"}'
+          a1_service_account: "serviceaccountid1"
+          a2_service_account: "serviceaccountid1"
+      FunctionName: !Sub "${AWS::StackName}-LambdaFunction-Login-Notification"
+    DependsOn:
+      - LambdaExecutionRole
+  LambdaInvokePermission: 
+      DependsOn: LambdaFunction
+      Type: 'AWS::Lambda::Permission'
+      Properties:
+        FunctionName: "CliLogin-Notification-LambdaFunction-Login-Notification"
+        Action: "lambda:InvokeFunction"
+        Principal: !Sub "logs.eu-west-1.amazonaws.com"
+        SourceArn:  !Ref CloudtrailLogGroupArn
+Outputs:
+  LambdaFunctionArn:
+    Description: The Arn of Lambda Function
+    Value: !GetAtt LambdaFunction.Arn    
